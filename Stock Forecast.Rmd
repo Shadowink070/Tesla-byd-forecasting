@@ -1,0 +1,338 @@
+```{r}
+# =========================
+# Tesla & BYD monthly forecasting: ARIMA / ETS
+# Protocol: monthly aggregation -> train/test split -> fit -> diagnostics -> forecast -> multi-metric evaluation
+# Sample: 2015-01 to 2024-12 (train: 2015-2022, test: 2023-2024)
+# =========================
+
+library(quantmod)
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(zoo)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+
+# -------------------------
+# Global config 
+# -------------------------
+CFG <- list(
+  start_date = as.Date("2015-01-01"),
+  end_date   = as.Date("2024-12-31"),
+  train_end  = c(2022, 12),     # end of training window (YYYY, MM)
+  test_start = c(2023,  1),     # start of test window (YYYY, MM)
+  freq       = 12,
+  include_sarima = FALSE,       # set TRUE if you want SARIMA as extra benchmark
+  lb_lag_max = 24,              # Ljung-Box max lag
+  level_ci   = c(80, 95),       # forecast intervals
+  best_metric = "RMSE"          # choose best model by this test metric
+)
+
+# -------------------------
+# Helper functions
+# -------------------------
+ym_to_date <- function(ym) as.Date(as.yearmon(ym))
+
+fc_to_df <- function(fc){
+  dates <- ym_to_date(time(fc$mean))
+  data.frame(
+    Date     = dates,
+    Forecast = as.numeric(fc$mean),
+    Lo80     = as.numeric(fc$lower[, "80%"]),
+    Hi80     = as.numeric(fc$upper[, "80%"]),
+    Lo95     = as.numeric(fc$lower[, "95%"]),
+    Hi95     = as.numeric(fc$upper[, "95%"])
+  )
+}
+
+medae_in_sample <- function(fit_obj) {
+  median(abs(na.omit(as.numeric(residuals(fit_obj)))))
+}
+
+medae_oos <- function(fc_mean, actual_ts) {
+  median(abs(as.numeric(fc_mean) - as.numeric(actual_ts)))
+}
+
+safe_lb_test <- function(resid_vec, lag){
+  # Return Ljung-Box p-value (NA if not enough data)
+  resid_vec <- as.numeric(na.omit(resid_vec))
+  if(length(resid_vec) < (lag + 2)) return(NA_real_)
+  suppressWarnings(Box.test(resid_vec, lag = lag, type = "Ljung-Box")$p.value)
+}
+
+make_monthly_panel <- function(df_daily){
+  # df_daily must contain Date, Open, Close, AdjClose, Volume
+  df_daily %>%
+    mutate(YearMonth = format(Date, "%Y-%m")) %>%
+    group_by(YearMonth) %>%
+    summarise(
+      Date        = as.Date(paste0(first(YearMonth), "-01")),
+      MonthOpen   = first(Open),
+      MonthClose  = last(Close),
+      AdjCloseAvg = mean(AdjClose, na.rm = TRUE),
+      VolumeSum   = sum(Volume, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(Date)
+}
+
+build_ts <- function(df_monthly, value_col, freq = 12){
+  ts(
+    df_monthly[[value_col]],
+    start = c(year(min(df_monthly$Date)), month(min(df_monthly$Date))),
+    frequency = freq
+  )
+}
+
+extract_acc <- function(fc_obj, test_ts){
+  # forecast::accuracy(fc_obj, test_ts) returns matrix with Training/Test set rows
+  acc <- accuracy(fc_obj, test_ts)
+  # robustly pull "Test set" row
+  out <- acc[which(rownames(acc) == "Test set"), , drop = FALSE]
+  out
+}
+
+# -------------------------
+# Main pipeline
+# -------------------------
+run_pipeline <- function(symbol, label, cfg = CFG) {
+
+  cat("\n==============================\n")
+  cat("Processing:", label, "(", symbol, ")\n")
+  cat("==============================\n")
+
+  # 1) Fetch daily data (Adjusted Close + OHLC + Volume)
+  getSymbols(symbol, src = "yahoo",
+             from = cfg$start_date, to = cfg$end_date + 1,
+             auto.assign = TRUE, warnings = FALSE)
+
+  xt <- get(symbol)
+
+  df_daily <- data.frame(
+    Date     = as.Date(index(xt)),
+    Open     = as.numeric(Op(xt)),
+    High     = as.numeric(Hi(xt)),
+    Low      = as.numeric(Lo(xt)),
+    Close    = as.numeric(Cl(xt)),
+    AdjClose = as.numeric(Ad(xt)),
+    Volume   = as.numeric(Vo(xt))
+  ) %>%
+    na.omit() %>%
+    filter(Date >= cfg$start_date, Date <= cfg$end_date) %>%
+    arrange(Date)
+
+  # 2) Monthly aggregation (protocol)
+  df_monthly <- make_monthly_panel(df_daily)
+
+  # Basic descriptive stats (monthly average adjusted close)
+  cat("Monthly AdjCloseAvg summary (", format(min(df_monthly$Date)), "to", format(max(df_monthly$Date)), ")\n", sep="")
+  cat("  N    :", nrow(df_monthly), "\n")
+  cat("  Mean :", round(mean(df_monthly$AdjCloseAvg), 2), "\n")
+  cat("  Min  :", round(min(df_monthly$AdjCloseAvg), 2), "\n")
+  cat("  Max  :", round(max(df_monthly$AdjCloseAvg), 2), "\n\n")
+
+  # 3) Build time series for modelling
+  ts_data <- build_ts(df_monthly, "AdjCloseAvg", freq = cfg$freq)
+
+  # 4) Exploratory plot (monthly series)
+  p_series <- ggplot(df_monthly, aes(Date, AdjCloseAvg)) +
+    geom_line(linewidth = 0.9) +
+    labs(
+      title = paste(label, "Monthly Average Adjusted Close"),
+      x = "Year", y = "Adj Close (Monthly Avg)"
+    ) +
+    theme_minimal()
+  print(p_series)
+
+  # Optional: STL decomposition (exploratory; does not imply you model seasonality)
+  suppressWarnings({
+    plot(stl(ts_data, s.window = "periodic"),
+         main = paste("STL Decomposition (Exploratory):", label))
+  })
+
+  # 5) Train/test split (explicit evaluation design)
+  train_ts <- window(ts_data, end = cfg$train_end)
+  test_ts  <- window(ts_data, start = cfg$test_start)
+  h_test   <- length(test_ts)
+
+  cat("Train window ends:", paste(cfg$train_end, collapse="-"), "\n")
+  cat("Test window starts:", paste(cfg$test_start, collapse="-"), "\n")
+  cat("Test horizon (months):", h_test, "\n\n")
+
+  # 6) Fit baseline models
+  # ARIMA: non-seasonal baseline
+  fit_arima <- auto.arima(
+    train_ts,
+    seasonal = FALSE,
+    stepwise = FALSE,
+    approximation = FALSE
+  )
+
+  # ETS: AAN damped baseline
+  fit_ets <- ets(train_ts, model = "AAN", damped = TRUE)
+
+  # Optional SARIMA (benchmark)
+  if (isTRUE(cfg$include_sarima)) {
+    fit_sarima <- auto.arima(
+      train_ts,
+      seasonal = TRUE,
+      stepwise = FALSE,
+      approximation = FALSE
+    )
+  }
+
+  # 7) Diagnostics (residual checks)
+  lb_lag <- min(cfg$lb_lag_max, floor(length(train_ts) / 5))
+  cat("Diagnostics (Ljung-Box lag =", lb_lag, ")\n")
+
+  arima_lb <- safe_lb_test(residuals(fit_arima), lb_lag)
+  ets_lb   <- safe_lb_test(residuals(fit_ets),   lb_lag)
+
+  cat("  ARIMA  Ljung-Box p-value:", arima_lb, "\n")
+  cat("  ETS    Ljung-Box p-value:", ets_lb,   "\n")
+
+  if (isTRUE(cfg$include_sarima)) {
+    sarima_lb <- safe_lb_test(residuals(fit_sarima), lb_lag)
+    cat("  SARIMA Ljung-Box p-value:", sarima_lb, "\n")
+  }
+  cat("\n")
+
+  # Visual residual diagnostics
+  suppressWarnings({
+    checkresiduals(fit_arima)
+    checkresiduals(fit_ets)
+    if (isTRUE(cfg$include_sarima)) checkresiduals(fit_sarima)
+  })
+
+  # 8) Forecast to test horizon + multi-metric evaluation
+  fc_arima <- forecast(fit_arima, h = h_test, level = cfg$level_ci)
+  fc_ets   <- forecast(fit_ets,   h = h_test, level = cfg$level_ci)
+
+  acc_arima <- extract_acc(fc_arima, test_ts)
+  acc_ets   <- extract_acc(fc_ets,   test_ts)
+
+  # build out-of-sample table
+  acc_out <- data.frame(
+    Model = c("ARIMA", "ETS(AAN,damped)"),
+    RMSE  = c(acc_arima[,"RMSE"], acc_ets[,"RMSE"]),
+    MAE   = c(acc_arima[,"MAE"],  acc_ets[,"MAE"]),
+    MAPE  = c(acc_arima[,"MAPE"], acc_ets[,"MAPE"]),
+    MedAE = c(
+      medae_oos(fc_arima$mean, test_ts),
+      medae_oos(fc_ets$mean,   test_ts)
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  if (isTRUE(cfg$include_sarima)) {
+    fc_sarima  <- forecast(fit_sarima, h = h_test, level = cfg$level_ci)
+    acc_sarima <- extract_acc(fc_sarima, test_ts)
+
+    acc_out <- bind_rows(
+      acc_out,
+      data.frame(
+        Model = "SARIMA",
+        RMSE  = acc_sarima[,"RMSE"],
+        MAE   = acc_sarima[,"MAE"],
+        MAPE  = acc_sarima[,"MAPE"],
+        MedAE = medae_oos(fc_sarima$mean, test_ts),
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  print(acc_out)
+
+  # 9) Test period plot: Actual vs Forecast + intervals
+  df_test_actual <- data.frame(
+    Date = ym_to_date(time(test_ts)),
+    Actual = as.numeric(test_ts)
+  )
+
+  df_fc_arima <- fc_to_df(fc_arima) %>% mutate(Model = "ARIMA")
+  df_fc_ets   <- fc_to_df(fc_ets)   %>% mutate(Model = "ETS")
+
+  df_fc_all <- bind_rows(df_fc_arima, df_fc_ets)
+
+  p_test <- ggplot() +
+    geom_line(data = df_test_actual, aes(Date, Actual), linewidth = 0.9) +
+    geom_ribbon(
+      data = df_fc_all,
+      aes(Date, ymin = Lo95, ymax = Hi95),
+      alpha = 0.12
+    ) +
+    geom_ribbon(
+      data = df_fc_all,
+      aes(Date, ymin = Lo80, ymax = Hi80),
+      alpha = 0.20
+    ) +
+    geom_line(
+      data = df_fc_all,
+      aes(Date, Forecast, linetype = Model),
+      linewidth = 0.9
+    ) +
+    labs(
+      title = paste(label, "Test Period Forecasts (2023–2024)"),
+      subtitle = "Actual (solid) vs Forecast (linetype) with 80/95% intervals",
+      x = "Year", y = "Adj Close (Monthly Avg)"
+    ) +
+    theme_minimal()
+  print(p_test)
+
+  # 10) Select best model on test set metric, refit on full sample, and forecast next 12 months
+  metric <- cfg$best_metric
+  best_name <- acc_out$Model[which.min(acc_out[[metric]])]
+  cat("\nBest model by", metric, "on test set:", best_name, "\n")
+
+  best_fit_full <- switch(
+    best_name,
+    "ARIMA"           = auto.arima(ts_data, seasonal = FALSE, stepwise = FALSE, approximation = FALSE),
+    "ETS(AAN,damped)" = ets(ts_data, model = "AAN", damped = TRUE),
+    "SARIMA"          = auto.arima(ts_data, seasonal = TRUE, stepwise = FALSE, approximation = FALSE)
+  )
+
+  fc_future <- forecast(best_fit_full, h = 12, level = cfg$level_ci)
+  df_future <- fc_to_df(fc_future)
+
+  df_hist <- df_monthly %>% transmute(Date, Value = AdjCloseAvg)
+
+  p_future <- ggplot() +
+    geom_line(data = df_hist, aes(Date, Value), linewidth = 0.8) +
+    geom_ribbon(data = df_future, aes(Date, ymin = Lo95, ymax = Hi95), alpha = 0.12) +
+    geom_ribbon(data = df_future, aes(Date, ymin = Lo80, ymax = Hi80), alpha = 0.20) +
+    geom_line(data = df_future, aes(Date, Forecast), linewidth = 0.9) +
+    labs(
+      title = paste(label, "Next 12 Months Forecast (Best:", best_name, ")"),
+      x = "Year", y = "Adj Close (Monthly Avg)"
+    ) +
+    theme_minimal()
+  print(p_future)
+
+  # Return objects you might want to export
+  list(
+    monthly_panel = df_monthly,
+    ts_data = ts_data,
+    train_ts = train_ts,
+    test_ts = test_ts,
+    fits = list(arima = fit_arima, ets = fit_ets, sarima = if (isTRUE(cfg$include_sarima)) fit_sarima else NULL),
+    forecasts = list(arima = fc_arima, ets = fc_ets, sarima = if (isTRUE(cfg$include_sarima)) fc_sarima else NULL),
+    diagnostics = list(
+      lb_lag = lb_lag,
+      arima_lb_p = arima_lb,
+      ets_lb_p = ets_lb,
+      sarima_lb_p = if (isTRUE(cfg$include_sarima)) sarima_lb else NULL
+    ),
+    acc_out = acc_out,
+    best_model = best_name
+  )
+}
+
+# -------------------------
+# Run both
+# -------------------------
+tsla <- run_pipeline("TSLA", "Tesla (TSLA)")
+byd  <- run_pipeline("1211.HK", "BYD (1211.HK)")
+
+
+```
