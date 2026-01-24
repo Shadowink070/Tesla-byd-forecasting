@@ -1,7 +1,6 @@
 ```{r}
 # =========================
 # Tesla & BYD monthly forecasting: ARIMA / ETS
-# Protocol: monthly aggregation -> train/test split -> fit -> diagnostics -> forecast -> multi-metric evaluation
 # Sample: 2015-01 to 2024-12 (train: 2015-2022, test: 2023-2024)
 # =========================
 
@@ -14,7 +13,7 @@ library(dplyr)
 library(lubridate)
 library(tidyr)
 
-# -------------------------
+
 # Global config 
 # -------------------------
 CFG <- list(
@@ -29,7 +28,7 @@ CFG <- list(
   best_metric = "RMSE"          # choose best model by this test metric
 )
 
-# -------------------------
+
 # Helper functions
 # -------------------------
 ym_to_date <- function(ym) as.Date(as.yearmon(ym))
@@ -93,14 +92,10 @@ extract_acc <- function(fc_obj, test_ts){
   out
 }
 
-# -------------------------
+
 # Main pipeline
 # -------------------------
 run_pipeline <- function(symbol, label, cfg = CFG) {
-
-  cat("\n==============================\n")
-  cat("Processing:", label, "(", symbol, ")\n")
-  cat("==============================\n")
 
   # 1) Fetch daily data (Adjusted Close + OHLC + Volume)
   getSymbols(symbol, src = "yahoo",
@@ -328,7 +323,7 @@ run_pipeline <- function(symbol, label, cfg = CFG) {
   )
 }
 
-# -------------------------
+
 # Run both
 # -------------------------
 tsla <- run_pipeline("TSLA", "Tesla (TSLA)")
